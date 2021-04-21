@@ -9,25 +9,32 @@ import pickle
 import os
 from tqdm import tqdm
 import itertools
+from nltk import word_tokenize, sent_tokenize
 
+class token():
+    def __init__(self, dep_, pos_):
+        self.dep_ = dep_
+        self.pos_ = pos_
 
 class Dataset():
     def __init__(self, input_pattern, shows, path):
-        self.dictionary = self.load_liwc_dictionaries(os.path.join(path, "data", "liwc.pk"))
+        self.dictionary = self.load_liwc_dictionaries(os.path.join(path, "liwc.pk"))
         self.load_agency_power(os.path.join(path, "FramesAgencyPower", "agency_power.csv"))
 
         self._subjects = ["nsubj", "agent"]
         self._objects = ["dobj", "iobj", "nsubjpass"]
 
-        self.male_cat = pickle.load(open(os.path.join(path, "data", "male.pk"), "rb"))
-        self.male_cat.extend(["him", "his", "himself"])
-        self.female_cat = pickle.load(open(os.path.join(path, "data", "female.pk"), "rb"))
-        self.female_cat.extend(["her", "hers", "herself"])
+        self.male_cat = pickle.load(open(os.path.join(path, "male.pk"), "rb"))
+        # self.male_cat.extend(["him", "his", "himself"])
+        self.female_cat = pickle.load(open(os.path.join(path, "female.pk"), "rb"))
+        # self.female_cat.extend(["her", "hers", "herself"])
 
         self.shows= shows
         self.input_pattern = input_pattern
         self.data_file = os.path.join(path, "all.csv")
         self.meta_file = os.path.join(path, "all_meta.csv")
+        self.lal_file = os.path.join(path, "all_lal.csv")
+
         self.final_file = os.path.join(path, "all_rearranged.csv")
 
     def load_liwc_dictionaries(self, liwc_path):
@@ -90,20 +97,55 @@ class Dataset():
             else:
                 result.to_csv(self.data_file, index=False, mode="a")
 
-    def get_roles(self):
+    def spacy_tokenize(self, sentence):
+        sentence = nlp(sentence)
+
+        dep_toks = dict()
+        dep_toks["Agent"] = [tok for tok in sentence if (tok.dep_ in self._subjects)]
+        dep_toks["Patient"] = [tok for tok in sentence if (tok.dep_ in self._objects)]
+        dep_toks["Other"] = [tok for tok in sentence if (tok.dep_ not in self._subjects
+                                                     and tok.dep_ not in self._objects)]
+        return dep_toks
+
+    def lal_tokenize(self, sentence, deps_line):
+        deps = [tok_dep[1:-1] for tok_dep in deps_line[1:-1].split(", ")]
+        tokens = [tok for sub_sentence in sent_tokenize(sentence) for tok in word_tokenize(sub_sentence)]
+        if len(deps) != len(tokens):
+            print(sentence)
+            print(deps)
+            print(tokens)
+            return False
+        else:
+            dep_toks = dict()
+            dep_toks["Agent"] = [tok for x, tok in enumerate(tokens) if (deps[x] in self._subjects)]
+            dep_toks["Patient"] = [tok for x, tok in enumerate(tokens) if (deps[x] in self._objects)]
+            dep_toks["Other"] = [tok for x, tok in enumerate(tokens) if (deps[x] not in self._subjects
+                                                                   and deps[x] not in self._objects)]
+            return dep_toks
+
+    def get_roles(self, method, lal_path=""):
         df = pd.read_csv(self.data_file)
         new_df = list()
-        complexity = list()
-        ans = defaultdict(list)
 
         for i, row in df.iterrows():
-            doc = nlp(row["Sentence"])
-            doc_gender = self.get_gender_role(doc)
+            if method == "spacy":
+                toks = self.spacy_tokenize(row["Sentence"])
+
+            elif method == "lal":
+                if i % 1000 == 0:
+                    self.lal_lines = open(os.path.join(lal_path, "output_syndeplabel_" + str(int(i / 1000)) + ".txt"), "r")\
+                        .readlines()
+                    print("Reading", i / 1000)
+                toks = self.lal_tokenize(row["Sentence"], self.lal_lines[i % 1000])
+                if not toks:
+                    continue
+            else:
+                print("wrong method, choose either spapcy or lal")
+                exit(1)
+
+            doc_gender = self.get_gender_role(toks, row["Sentence"])
             if sum([len(val) for val in doc_gender.values()]) > 0:
-                # vocab = self.liwc_ratio(row["Sentence"])
-                # for concept in vocab:
-                #    ans[concept].append(vocab[concept])
-                # complexity.append(self.get_height(doc))
+                vocab = self.liwc_ratio(row["Sentence"])
                 for key, gender_roles in doc_gender.items():
                     for tok, agency_power in gender_roles.items():
                         new_row = {k: v for k, v in row.items()}
@@ -113,35 +155,36 @@ class Dataset():
                         for score in ["agency", "power"]:
                             new_row["token_" + score] = -agency_power[score] if "Patient" in key \
                                 else agency_power[score]
-                        #new_row.update(vocab)
+                        new_row.update(vocab)
                         new_df.append(new_row)
 
-        #print("Removing", len(non))
-        #print("Comp", len(complexity))
-        #df = df.drop(non)
         print("Gendered Roles:", len(new_df))
-        pd.DataFrame(new_df).to_csv(self.meta_file, index=False)
+        if method == "spacy":
+            pd.DataFrame(new_df).to_csv(self.meta_file, index=False)
+        elif method == "lal":
+            pd.DataFrame(new_df).to_csv(self.lal_file, index=False)
 
-    def get_gender_role(self, sentence):
+    def get_gender_role(self, toks, sentence):
         # load male and female words, stored as pickle files
         roles = defaultdict(list)
-        if isinstance(sentence, str):
-            sentence = nlp(sentence)
+        sentence = nlp(sentence)
 
-        verbs = {tok : {"agency": self.get_agency(tok), "power": self.get_power(tok) }
+        verbs = {tok: {"agency": self.get_agency(tok), "power": self.get_power(tok)}
                  for tok in sentence if tok.pos_ == "VERB"}
 
-        toks = dict()
-        toks["Agent"] = [tok for tok in sentence if (tok.dep_ in self._subjects)]
-        toks["Patient"] = [tok for tok in sentence if (tok.dep_ in self._objects)]
-        toks["Other"] = [tok for tok in sentence if (tok.dep_ not in self._subjects
-                                                and tok.dep_ not in self._objects)]
         for role in ["Agent", "Patient", "Other"]:
             female, male = list(), list()
-            for sub in toks[role]:
-                zir_sub = str(sub).split()
+            for seg in toks[role]:
+                seg = str(seg)
+                zir_sub = seg.split()
                 female.extend([zir for zir in zir_sub if zir in self.female_cat])
                 male.extend([zir for zir in zir_sub if zir in self.male_cat])
+
+                if role == "Patient":
+                    if seg in ["her", "hers", "herself"]:
+                        female.extend(seg)
+                    if seg in ["him", "his", "himself"]:
+                        male.extend(seg)
 
             roles["Female_" + role] = {gen: {"agency": 0, "power": 0} for gen in female}
             roles["Male_" + role] = {gen: {"agency": 0, "power": 0} for gen in male}
@@ -149,20 +192,11 @@ class Dataset():
             if role == "Other":
                 continue
 
+
             roles["Female_" + role].update({gen: verbs[verb] for gen, verb in
                                         itertools.product(female, list(verbs.keys())) if gen in [str(x) for x in verb.children]})
             roles["Male_" + role].update({gen: verbs[verb] for gen, verb in
                                       itertools.product(male, list(verbs.keys())) if gen in [str(x) for x in verb.children]})
-            """
-            for gen in female:
-                for verb in verbs.keys():
-                    if gen in [str(x) for x in verb.children]:
-                        print(sentence, role, verb, verbs[verb], gen, roles["Female_" + role][gen])
-            for gen in male:
-                for verb in verbs.keys():
-                    if gen in [str(x) for x in verb.children]:
-                        print(sentence, role, verb, verbs[verb], gen, roles["Male_" + role][gen])
-            """
 
         return roles
 
